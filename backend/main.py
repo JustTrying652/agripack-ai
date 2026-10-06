@@ -63,65 +63,6 @@ client = OpenAI(
 def encode_image(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode('utf-8')
 
-@app.post("/api/v1/analyze-freshness")
-async def analyze_freshness(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
-    
-    # Read and encode the uploaded image
-    contents = await file.read()
-    base64_image = encode_image(contents)
-    
-    # The engineered heuristic prompt replacing custom CNN training
-    system_prompt = """
-    You are an expert agricultural freshness analyzer. You are evaluating a red cabbage anthocyanin pH sensor attached to food packaging. 
-    Analyze the dominant color of the sensor in the provided image based on this strict heuristic scale:
-    
-    - Deep Purple to Blue-Violet: Neutral pH (~6-7). Status: FRESH.
-    - Pink to Red: Acidic pH (< 5). Status: FRUIT ROT / FERMENTATION.
-    - Blue to Sea Green: Alkaline pH (> 8). Status: BACTERIAL DECAY (Cooked Food).
-    
-    Respond strictly with a raw JSON object (no markdown, no backticks) containing the following keys:
-    "color_detected" (string),
-    "estimated_ph_state" (string),
-    "freshness_percentage" (integer 0-100),
-    "status" (string: "FRESH", "WARNING", or "SPOILED"),
-    "action_required" (string: specific logistical instruction).
-    """
-
-    try:
-        # Pass the image to the Vision Language Model
-        response = client.chat.completions.create(
-            model="qwen-2.5-vl",  # Or whichever vision model you have provisioned on Groq
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Analyze this AgriPack sensor and return the JSON assessment."},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{file.content_type};base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0.1,  # Keep temperature low for consistent JSON output
-        )
-        
-        # Parse the string response into a JSON object
-        raw_output = response.choices[0].message.content.strip()
-        
-        # Strip markdown formatting if the model disobeys the prompt
-        if raw_output.startswith("```json"):
-            raw_output = raw_output[7:-3]
-            
-        return json.loads(raw_output)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -318,6 +259,69 @@ class StatusIn(BaseModel):
 class ChatIn(BaseModel):
     message: str
 # === END NEW ===
+
+
+
+@app.post("/api/v1/analyze-freshness")
+async def analyze_freshness(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
+    
+    # Read and encode the uploaded image
+    contents = await file.read()
+    base64_image = encode_image(contents)
+    
+    # The engineered heuristic prompt replacing custom CNN training
+    system_prompt = """
+    You are an expert agricultural freshness analyzer. You are evaluating a red cabbage anthocyanin pH sensor attached to food packaging. 
+    Analyze the dominant color of the sensor in the provided image based on this strict heuristic scale:
+    
+    - Deep Purple to Blue-Violet: Neutral pH (~6-7). Status: FRESH.
+    - Pink to Red: Acidic pH (< 5). Status: FRUIT ROT / FERMENTATION.
+    - Blue to Sea Green: Alkaline pH (> 8). Status: BACTERIAL DECAY (Cooked Food).
+    
+    Respond strictly with a raw JSON object (no markdown, no backticks) containing the following keys:
+    "color_detected" (string),
+    "estimated_ph_state" (string),
+    "freshness_percentage" (integer 0-100),
+    "status" (string: "FRESH", "WARNING", or "SPOILED"),
+    "action_required" (string: specific logistical instruction).
+    """
+
+    try:
+        # Pass the image to the Vision Language Model
+        response = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",  # Or whichever vision model you have provisioned on Groq
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze this AgriPack sensor and return the JSON assessment."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{file.content_type};base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1,  # Keep temperature low for consistent JSON output
+            max_tokens=300,
+        )
+        
+        # Parse the string response into a JSON object
+        raw_output = response.choices[0].message.content.strip()
+        
+        # Strip markdown formatting if the model disobeys the prompt
+        if raw_output.startswith("```json"):
+            raw_output = raw_output[7:-3]
+            
+        return json.loads(raw_output)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------- farmers ----------
