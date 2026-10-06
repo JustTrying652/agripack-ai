@@ -1,0 +1,24 @@
+# Python & Virtual Environments
+backend/venv/
+*/venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment Variables & Secrets
+.env
+*.env
+backend/.env
+
+# Local Databases & Uploads
+*.db
+*.sqlite3
+backend/uploads/
+uploads/
+
+# Frontend dependencies & builds
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+.DS_Store
+.vscode/
