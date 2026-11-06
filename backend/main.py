@@ -19,8 +19,6 @@ from openai import OpenAI                                   # === NEW ===
 
 load_dotenv()
 
-app = FastAPI(title="AgriPack AI Backend")
-
 BASE = Path(__file__).parent
 DB_PATH = BASE / "agri.db"
 UPLOADS = BASE / "uploads"
