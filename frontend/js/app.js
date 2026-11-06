@@ -51,7 +51,7 @@ const session = {
   clear: r => localStorage.removeItem('session_' + r)
 };
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = 'https://ecoloop-api-f240.onrender.com';
 function photoUrl(path) {
   if (!path) return '';
   return path.startsWith('http') ? path : API_BASE + path;
