@@ -51,6 +51,11 @@ const session = {
   clear: r => localStorage.removeItem('session_' + r)
 };
 
+const API_BASE = 'http://127.0.0.1:8000';
+function photoUrl(path) {
+  if (!path) return '';
+  return path.startsWith('http') ? path : API_BASE + path;
+}
 async function api(path, { method = 'GET', body, form, role } = {}) {
   const headers = {};
   const s = role && session.get(role);
@@ -59,7 +64,7 @@ async function api(path, { method = 'GET', body, form, role } = {}) {
   if (form) payload = form;
   else if (body) { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body); }
   let res;
-    try { res = await fetch('/api' + path, { method, headers, body: payload, signal: AbortSignal.timeout(30000) }); }
+    try { res = await fetch(API_BASE + '/api' + path, { method, headers, body: payload, signal: AbortSignal.timeout(30000) }); }
   catch (e) {
     console.error('Request failed:', path, e);
     throw new Error(e.name === 'TimeoutError'
@@ -490,7 +495,7 @@ setInterval(() => {
 function farmerTable(subs) {
   if (!subs.length) return 'No submissions yet.';
   return `<table><tr><th>Photo</th><th>Farmer</th><th>Category</th><th>Weight</th><th>Description</th><th>Status</th><th>Action</th></tr>${subs.map(s => `
-  <tr><td>${s.photo ? `<img src="${esc(s.photo)}">` : '-'}</td><td>${esc(s.farmer)}<br><small>${esc(s.loc)}</small></td>
+  <tr><td>${s.photo ? `<img src="${esc(photoUrl(s.photo))}">` : '-'}</td><td>${esc(s.farmer)}<br><small>${esc(s.loc)}</small></td>
   <td>${prod(s.cat).icon} ${prod(s.cat).name}</td><td>${s.weight} kg</td><td>${esc(s.desc)}</td>
   <td>${statusBadge(s.status)}<br><small>${esc(s.aiNote)}</small></td>
   <td>${['flagged', 'review'].includes(s.status) ? `<button class="btn sm" onclick="setSub('${s.id}','approved')">Approve</button> <button class="btn sm bad" onclick="setSub('${s.id}','rejected')">Reject</button>` : ''}</td></tr>`).join('')}</table>`;

@@ -5,13 +5,15 @@ import json
 import base64
 import re
 import secrets
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -20,12 +22,13 @@ from openai import OpenAI                                   # === NEW ===
 load_dotenv()
 
 BASE = Path(__file__).parent
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = BASE / "agri.db"
 UPLOADS = BASE / "uploads"
 UPLOADS.mkdir(exist_ok=True)
 FRONTEND = BASE.parent / "frontend"
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # set a real one before deploying
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 THRESHOLD_KG = 50
 MAX_PHOTO = 5 * 1024 * 1024
 EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
@@ -37,19 +40,7 @@ groq = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1") i
 AI_MODEL = "openai/gpt-oss-120b"
 # === END NEW ===
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS farmers(id TEXT PRIMARY KEY, name TEXT, loc TEXT, created TEXT,
-                                   username TEXT, pw_hash TEXT, salt TEXT);
-CREATE TABLE IF NOT EXISTS customers(id TEXT PRIMARY KEY, name TEXT, email TEXT UNIQUE,
-                                     pw_hash TEXT, salt TEXT, created TEXT);
-CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, role TEXT, user_id TEXT);
-CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, farmer_id TEXT, cat TEXT, descr TEXT,
-                                       weight REAL, photo TEXT, status TEXT, ai_note TEXT, created TEXT);
-CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, customer_id TEXT, cat TEXT, qty INTEGER,
-                                    status TEXT, created TEXT);
-CREATE TABLE IF NOT EXISTS ai_actions(id TEXT PRIMARY KEY, actor TEXT, action TEXT, target TEXT,
-                                      detail TEXT, created TEXT);
-"""
+
 
 
 # Initialize the Groq client only when an API key is available
@@ -62,16 +53,83 @@ def encode_image(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode('utf-8')
 
 
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.executescript(SCHEMA)
-    have = {row[1] for row in con.execute("PRAGMA table_info(farmers)")}
-    for col in ("username", "pw_hash", "salt"):
-        if col not in have:
-            con.execute(f"ALTER TABLE farmers ADD COLUMN {col} TEXT")
-    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_farmers_username ON farmers(username)")
-    con.commit()
-    con.close()
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+    with psycopg.connect(DATABASE_URL) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS farmers (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                loc TEXT,
+                created TEXT,
+                username TEXT,
+                pw_hash TEXT,
+                salt TEXT
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS customers (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                email TEXT UNIQUE,
+                pw_hash TEXT,
+                salt TEXT,
+                created TEXT
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS tokens (
+                token TEXT PRIMARY KEY,
+                role TEXT,
+                user_id TEXT
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS submissions (
+                id TEXT PRIMARY KEY,
+                farmer_id TEXT,
+                cat TEXT,
+                descr TEXT,
+                weight REAL,
+                photo TEXT,
+                status TEXT,
+                ai_note TEXT,
+                created TEXT
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS requests (
+                id TEXT PRIMARY KEY,
+                customer_id TEXT,
+                cat TEXT,
+                qty INTEGER,
+                status TEXT,
+                created TEXT
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS ai_actions (
+                id TEXT PRIMARY KEY,
+                actor TEXT,
+                action TEXT,
+                target TEXT,
+                detail TEXT,
+                created TEXT
+            )
+        """)
+
+        con.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_farmers_username
+            ON farmers(username)
+        """)
 
 
 USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
@@ -79,6 +137,15 @@ USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
 init_db()
 app = FastAPI(title="EcoLoop API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        os.getenv("FRONTEND_URL", "http://127.0.0.1:5500"),
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.middleware("http")
 async def no_cache(request, call_next):
@@ -96,13 +163,11 @@ async def no_cache(request, call_next):
 
 # ---------- helpers ----------
 def db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
+    con = postgres_con()
     try:
         yield con
     finally:
         con.close()
-
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -118,7 +183,7 @@ def hash_pw(password: str, salt: str) -> str:
 
 def new_token(con, role: str, user_id: str) -> str:
     token = secrets.token_urlsafe(32)
-    con.execute("INSERT INTO tokens VALUES(?,?,?)", (token, role, user_id))
+    con.execute("INSERT INTO tokens VALUES(%s,%s,%s)", (token, role, user_id))
     con.commit()
     return token
 
@@ -127,7 +192,7 @@ def auth(role: str):
     def dep(authorization: Optional[str] = Header(None), con=Depends(db)):
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401, "Not signed in")
-        row = con.execute("SELECT * FROM tokens WHERE token=?", (authorization[7:],)).fetchone()
+        row = con.execute("SELECT * FROM tokens WHERE token=%s", (authorization[7:],)).fetchone()
         if not row or row["role"] != role:
             raise HTTPException(401, "Invalid session")
         return row["user_id"]
@@ -340,9 +405,9 @@ def farmer_register(body: FarmerIn, con=Depends(db)):
         raise HTTPException(400, "Password must be at least 6 characters")
     fid, salt = new_id(), secrets.token_hex(16)
     try:
-        con.execute("INSERT INTO farmers(id, name, loc, created, username, pw_hash, salt) VALUES(?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO farmers(id, name, loc, created, username, pw_hash, salt) VALUES(%s,%s,%s,%s,%s,%s,%s)",
                     (fid, name, loc, now(), username, hash_pw(body.password, salt), salt))
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         raise HTTPException(409, "That username is taken. Choose another, or sign in if it is yours")
     token = new_token(con, "farmer", fid)
     return {"token": token, "profile": {"id": fid, "name": name, "loc": loc, "username": username}}
@@ -350,7 +415,7 @@ def farmer_register(body: FarmerIn, con=Depends(db)):
 
 @app.post("/api/farmers/login")
 def farmer_login(body: FarmerLoginIn, con=Depends(db)):
-    row = con.execute("SELECT * FROM farmers WHERE username=?", (body.username.strip().lower(),)).fetchone()
+    row = con.execute("SELECT * FROM farmers WHERE username=%s", (body.username.strip().lower(),)).fetchone()
     if not row or not secrets.compare_digest(row["pw_hash"], hash_pw(body.password, row["salt"])):
         raise HTTPException(401, "Wrong username or password")
     token = new_token(con, "farmer", row["id"])
@@ -361,7 +426,7 @@ def farmer_login(body: FarmerLoginIn, con=Depends(db)):
 @app.post("/api/logout")
 def logout(authorization: Optional[str] = Header(None), con=Depends(db)):
     if authorization and authorization.startswith("Bearer "):
-        con.execute("DELETE FROM tokens WHERE token=?", (authorization[7:],))
+        con.execute("DELETE FROM tokens WHERE token=%s", (authorization[7:],))
         con.commit()
     return {"ok": True}
 
@@ -400,15 +465,15 @@ def create_submission(
     # === END CHANGE ===
 
     sid = new_id()
-    con.execute("INSERT INTO submissions VALUES(?,?,?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO submissions VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (sid, farmer_id, cat, desc, weight, photo_url, status, note, now()))
     con.commit()
-    return sub_out(con.execute(SUB_SQL + " WHERE s.id=?", (sid,)).fetchone())
+    return sub_out(con.execute(SUB_SQL + " WHERE s.id=%s", (sid,)).fetchone())
 
 
 @app.get("/api/submissions/mine")
 def my_submissions(farmer_id: str = Depends(auth("farmer")), con=Depends(db)):
-    rows = con.execute(SUB_SQL + " WHERE s.farmer_id=? ORDER BY s.created DESC", (farmer_id,)).fetchall()
+    rows = con.execute(SUB_SQL + " WHERE s.farmer_id=%s ORDER BY s.created DESC", (farmer_id,)).fetchall()
     return [sub_out(r) for r in rows]
 
 
@@ -420,9 +485,9 @@ def customer_register(body: CustomerIn, con=Depends(db)):
         raise HTTPException(400, "Enter a name, a valid email and a password of 6+ characters")
     cid, salt = new_id(), secrets.token_hex(16)
     try:
-        con.execute("INSERT INTO customers VALUES(?,?,?,?,?,?)",
+        con.execute("INSERT INTO customers VALUES(%s,%s,%s,%s,%s,%s)",
                     (cid, name, email, hash_pw(body.password, salt), salt, now()))
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         raise HTTPException(409, "That email is already registered, try signing in")
     token = new_token(con, "customer", cid)
     return {"token": token, "profile": {"id": cid, "name": name, "email": email}}
@@ -430,7 +495,7 @@ def customer_register(body: CustomerIn, con=Depends(db)):
 
 @app.post("/api/customers/login")
 def customer_login(body: LoginIn, con=Depends(db)):
-    row = con.execute("SELECT * FROM customers WHERE email=?", (body.email.strip().lower(),)).fetchone()
+    row = con.execute("SELECT * FROM customers WHERE email=%s", (body.email.strip().lower(),)).fetchone()
     if not row or not secrets.compare_digest(row["pw_hash"], hash_pw(body.password, row["salt"])):
         raise HTTPException(401, "Wrong email or password")
     token = new_token(con, "customer", row["id"])
@@ -442,26 +507,26 @@ def create_request(body: RequestIn, customer_id: str = Depends(auth("customer"))
     if body.cat not in CATEGORIES or not (1 <= body.qty <= 100000):
         raise HTTPException(400, "Choose a valid package and quantity")
     rid = new_id()
-    con.execute("INSERT INTO requests VALUES(?,?,?,?,?,?)",
+    con.execute("INSERT INTO requests VALUES(%s,%s,%s,%s,%s,%s)",
                 (rid, customer_id, body.cat, body.qty, "requested", now()))
     con.commit()
-    return req_out(con.execute(REQ_SQL + " WHERE r.id=?", (rid,)).fetchone())
+    return req_out(con.execute(REQ_SQL + " WHERE r.id=%s", (rid,)).fetchone())
 
 
 @app.get("/api/requests/mine")
 def my_requests(customer_id: str = Depends(auth("customer")), con=Depends(db)):
-    rows = con.execute(REQ_SQL + " WHERE r.customer_id=? ORDER BY r.created DESC", (customer_id,)).fetchall()
+    rows = con.execute(REQ_SQL + " WHERE r.customer_id=%s ORDER BY r.created DESC", (customer_id,)).fetchall()
     return [req_out(r) for r in rows]
 
 
 @app.post("/api/requests/{rid}/pay")
 def pay_request(rid: str, customer_id: str = Depends(auth("customer")), con=Depends(db)):
-    r = con.execute("SELECT * FROM requests WHERE id=? AND customer_id=?", (rid, customer_id)).fetchone()
+    r = con.execute("SELECT * FROM requests WHERE id=%s AND customer_id=%s", (rid, customer_id)).fetchone()
     if not r:
         raise HTTPException(404, "Request not found")
     if r["status"] != "payment_requested":
         raise HTTPException(400, "Payment has not been requested for this order")
-    con.execute("UPDATE requests SET status='paid' WHERE id=?", (rid,))
+    con.execute("UPDATE requests SET status='paid' WHERE id=%s", (rid,))
     con.commit()
     return {"ok": True}
 
@@ -469,8 +534,18 @@ def pay_request(rid: str, customer_id: str = Depends(auth("customer")), con=Depe
 # ---------- admin ----------
 @app.post("/api/admin/login")
 def admin_login(body: AdminIn, con=Depends(db)):
-    if not secrets.compare_digest(body.password.encode(), ADMIN_PASSWORD.encode()):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin login is not configured"
+        )
+
+    if not secrets.compare_digest(
+        body.password.encode(),
+        ADMIN_PASSWORD.encode()
+    ):
         raise HTTPException(401, "Wrong password")
+
     return {"token": new_token(con, "admin", "admin")}
 
 
@@ -481,12 +556,12 @@ def all_submissions(_admin=Depends(auth("admin")), con=Depends(db)):
 
 @app.patch("/api/submissions/{sid}")
 def review_submission(sid: str, body: StatusIn, _admin=Depends(auth("admin")), con=Depends(db)):
-    r = con.execute("SELECT status FROM submissions WHERE id=?", (sid,)).fetchone()
+    r = con.execute("SELECT status FROM submissions WHERE id=%s", (sid,)).fetchone()
     if not r:
         raise HTTPException(404, "Submission not found")
     if body.status not in ("approved", "rejected") or r["status"] not in ("flagged", "review"):
         raise HTTPException(400, "That change isn't allowed")
-    con.execute("UPDATE submissions SET status=? WHERE id=?", (body.status, sid))
+    con.execute("UPDATE submissions SET status=%s WHERE id=%s", (body.status, sid))
     con.commit()
     return {"ok": True}
 
@@ -501,12 +576,12 @@ NEXT_STEP = {"requested": "payment_requested", "paid": "delivered"}
 
 @app.patch("/api/requests/{rid}")
 def advance_request(rid: str, body: StatusIn, _admin=Depends(auth("admin")), con=Depends(db)):
-    r = con.execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()
+    r = con.execute("SELECT status FROM requests WHERE id=%s", (rid,)).fetchone()
     if not r:
         raise HTTPException(404, "Request not found")
     if NEXT_STEP.get(r["status"]) != body.status:
         raise HTTPException(400, f"Can't move from {r['status']} to {body.status}")
-    con.execute("UPDATE requests SET status=? WHERE id=?", (body.status, rid))
+    con.execute("UPDATE requests SET status=%s WHERE id=%s", (body.status, rid))
     con.commit()
     return {"ok": True}
 
@@ -516,18 +591,27 @@ import json as _json
 
 
 def _admin_con():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    return postgres_con()
 
+def postgres_con():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
+    )
 
 def tool_count_submissions(status: Optional[str] = None) -> str:
     con = _admin_con()
     try:
         if status:
-            n = con.execute("SELECT COUNT(*) FROM submissions WHERE status=?", (status,)).fetchone()[0]
+            n = con.execute(
+    "SELECT COUNT(*) AS count FROM submissions WHERE status=%s",
+    (status,)
+).fetchone()["count"]
         else:
-            n = con.execute("SELECT COUNT(*) FROM submissions").fetchone()[0]
+            n = con.execute("SELECT COUNT(*) AS count FROM submissions").fetchone()["count"]
         return _json.dumps({"count": n, "status": status or "all"})
     finally:
         con.close()
@@ -539,7 +623,7 @@ def tool_top_farmers(limit: int = 5) -> str:
         rows = con.execute(
             "SELECT f.name, COUNT(*) AS n FROM submissions s "
             "JOIN farmers f ON f.id = s.farmer_id "
-            "GROUP BY f.id ORDER BY n DESC LIMIT ?", (limit,)
+            "GROUP BY f.id ORDER BY n DESC LIMIT %s", (limit,)
         ).fetchall()
         return _json.dumps([{"farmer": r["name"], "submissions": r["n"]} for r in rows])
     finally:
@@ -562,13 +646,13 @@ def tool_pending_requests() -> str:
 def tool_auto_advance(rid: str) -> str:
     con = _admin_con()
     try:
-        r = con.execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()
+        r = con.execute("SELECT status FROM requests WHERE id=%s", (rid,)).fetchone()
         if not r:
             return _json.dumps({"error": "not found"})
         nxt = NEXT_STEP.get(r["status"])
         if not nxt:
             return _json.dumps({"error": f"no next step from {r['status']}"})
-        con.execute("UPDATE requests SET status=? WHERE id=?", (nxt, rid))
+        con.execute("UPDATE requests SET status=%s WHERE id=%s", (nxt, rid))
         con.commit()
         return _json.dumps({"id": rid, "from": r["status"], "to": nxt})
     finally:
@@ -580,7 +664,7 @@ def _log_action(action: str, target: str, detail: str = "") -> None:
         con = _admin_con()
         try:
             con.execute(
-                "INSERT INTO ai_actions VALUES(?,?,?,?,?,?)",
+                "INSERT INTO ai_actions VALUES(%s,%s,%s,%s,%s,%s)",
                 (new_id(), "admin", action, target, detail, now()),
             )
             con.commit()
@@ -594,13 +678,13 @@ def tool_approve_submission(sid: str, reason: str = "") -> str:
     """Admin-only: mark a flagged/review submission as approved. Logs the action."""
     con = _admin_con()
     try:
-        r = con.execute("SELECT status FROM submissions WHERE id=?", (sid,)).fetchone()
+        r = con.execute("SELECT status FROM submissions WHERE id=%s", (sid,)).fetchone()
         if not r:
             return _json.dumps({"error": f"submission {sid} not found"})
         if r["status"] not in ("flagged", "review"):
             return _json.dumps({"error": f"submission {sid} is '{r['status']}', can't approve"})
         note = f"AI-approved. {reason}".strip() if reason else "AI-approved."
-        con.execute("UPDATE submissions SET status='approved', ai_note=? WHERE id=?", (note, sid))
+        con.execute("UPDATE submissions SET status='approved', ai_note=%s WHERE id=%s", (note, sid))
         con.commit()
         _log_action("approve_submission", sid, reason)
         return _json.dumps({"ok": True, "id": sid, "new_status": "approved"})
@@ -612,13 +696,13 @@ def tool_reject_submission(sid: str, reason: str = "") -> str:
     """Admin-only: mark a flagged/review submission as rejected. Logs the action."""
     con = _admin_con()
     try:
-        r = con.execute("SELECT status FROM submissions WHERE id=?", (sid,)).fetchone()
+        r = con.execute("SELECT status FROM submissions WHERE id=%s", (sid,)).fetchone()
         if not r:
             return _json.dumps({"error": f"submission {sid} not found"})
         if r["status"] not in ("flagged", "review"):
             return _json.dumps({"error": f"submission {sid} is '{r['status']}', can't reject"})
         note = f"AI-rejected. {reason}".strip() if reason else "AI-rejected."
-        con.execute("UPDATE submissions SET status='rejected', ai_note=? WHERE id=?", (note, sid))
+        con.execute("UPDATE submissions SET status='rejected', ai_note=%s WHERE id=%s", (note, sid))
         con.commit()
         _log_action("reject_submission", sid, reason)
         return _json.dumps({"ok": True, "id": sid, "new_status": "rejected"})
@@ -637,11 +721,11 @@ def tool_find_submission(query: str) -> str:
         if not words:
             return _json.dumps([])
 
-        # Build: (id LIKE ? OR farmer LIKE ? OR cat LIKE ? OR descr LIKE ?) AND (...) AND (...)
+        # Build: (id LIKE %s OR farmer LIKE %s OR cat LIKE %s OR descr LIKE %s) AND (...) AND (...)
         clauses = []
         params = []
         for w in words:
-            clauses.append("(s.id LIKE ? OR f.name LIKE ? OR s.cat LIKE ? OR s.descr LIKE ?)")
+            clauses.append("(s.id LIKE %s OR f.name LIKE %s OR s.cat LIKE %s OR s.descr LIKE %s)")
             like = f"%{w}%"
             params.extend([like, like, like, like])
 
@@ -823,7 +907,7 @@ def ai_auto_review(_admin=Depends(auth("admin")), con=Depends(db)):
     for r in rows:
         status, note = ai_triage(r["weight"], r["descr"], r["photo"] is not None)
         if status in ("approved", "rejected"):
-            con.execute("UPDATE submissions SET status=?, ai_note=? WHERE id=?",
+            con.execute("UPDATE submissions SET status=%s, ai_note=%s WHERE id=%s",
                         (status, note, r["id"]))
             changed += 1
     con.commit()
@@ -833,4 +917,3 @@ def ai_auto_review(_admin=Depends(auth("admin")), con=Depends(db)):
 
 # ---------- static files (must come last) ----------
 app.mount("/uploads", StaticFiles(directory=UPLOADS), name="uploads")
-app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")
