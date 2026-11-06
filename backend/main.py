@@ -262,6 +262,11 @@ class ChatIn(BaseModel):
 
 @app.post("/api/v1/analyze-freshness")
 async def analyze_freshness(file: UploadFile = File(...)):
+    if not client:
+        raise HTTPException(
+            status_code=503,
+            detail="Freshness analysis is currently unavailable. AI service is not configured."
+        )
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
     
