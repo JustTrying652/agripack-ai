@@ -52,11 +52,11 @@ CREATE TABLE IF NOT EXISTS ai_actions(id TEXT PRIMARY KEY, actor TEXT, action TE
 """
 
 
-# Initialize the Groq client using the OpenAI SDK format
+# Initialize the Groq client only when an API key is available
 client = OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
+    api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
-)
+) if GROQ_API_KEY else None
 
 def encode_image(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode('utf-8')
